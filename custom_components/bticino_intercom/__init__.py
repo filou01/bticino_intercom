@@ -48,6 +48,13 @@ WEBSOCKET_CLIENT_KEY = "websocket_client"
 COORDINATOR_KEY = "coordinator"
 START_LISTENER_REMOVE_KEY = "start_listener_remove"
 
+
+def _is_invalid_access_token_error(err: ApiError) -> bool:
+    """Return True if an API error represents an invalid stored access token."""
+    error_message = str(err).lower()
+    return "403" in error_message or "invalid access token" in error_message
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up BTicino from a config entry."""
     username = entry.data[CONF_USERNAME]
@@ -80,20 +87,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             expires_at=saved_tokens.get("expires_at"),
         )
 
+    async def _async_authenticate_with_stored_credentials(err: Exception) -> None:
+        """Discard stale tokens and authenticate with the stored password."""
+        _LOGGER.warning(
+            "Stored BTicino tokens failed (%s), removing them and attempting full authentication",
+            err,
+        )
+        await token_store.async_remove()
+        try:
+            await auth_handler.authenticate()
+        except AuthError as auth_err:
+            raise ConfigEntryAuthFailed from auth_err
+        except ApiError as auth_err:
+            if _is_invalid_access_token_error(auth_err):
+                raise ConfigEntryAuthFailed from auth_err
+            raise ConfigEntryNotReady from auth_err
+
     try:
         # Validate credentials by attempting to get a token
         # With restored tokens this will use refresh instead of full auth
         await auth_handler.get_access_token()
     except AuthError as err:
-        _LOGGER.warning("Authentication failed, removing stored BTicino tokens")
-        await token_store.async_remove()
-        raise ConfigEntryAuthFailed from err
+        await _async_authenticate_with_stored_credentials(err)
     except ApiError as err:
-        error_message = str(err).lower()
-        if "403" in error_message or "invalid access token" in error_message:
-            _LOGGER.warning("Invalid BTicino access token, removing stored tokens")
-            await token_store.async_remove()
-            raise ConfigEntryAuthFailed from err
+        if _is_invalid_access_token_error(err):
+            await _async_authenticate_with_stored_credentials(err)
 
         _LOGGER.error("Client error during authentication: %s", err)
         raise ConfigEntryNotReady from err

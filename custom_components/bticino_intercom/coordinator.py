@@ -111,160 +111,190 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
         await token_store.async_remove()
         raise ConfigEntryAuthFailed(f"Authentication error: {err}") from err
 
+    async def _async_reauthenticate_with_stored_credentials(self, err: Exception) -> None:
+        """Remove stale tokens and authenticate with the stored config entry password."""
+        _LOGGER.warning(
+            "Authentication failed during BTicino update (%s), removing stored tokens and attempting full authentication",
+            err,
+        )
+        token_store = Store(self.hass, TOKEN_STORAGE_VERSION, f"{DOMAIN}.tokens.{self.entry.entry_id}")
+        await token_store.async_remove()
+        try:
+            await self.account.auth_handler.authenticate()
+        except AuthError as auth_err:
+            raise ConfigEntryAuthFailed(f"Authentication error: {auth_err}") from auth_err
+        except ApiError as auth_err:
+            if self._is_invalid_access_token_error(auth_err):
+                raise ConfigEntryAuthFailed(f"Authentication error: {auth_err}") from auth_err
+            raise UpdateFailed(f"Failed to re-authenticate with stored credentials: {auth_err}") from auth_err
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the API, register devices, and return the combined data."""
+        for attempt in range(2):
+            try:
+                return await self._async_update_data_once()
+            except ConfigEntryAuthFailed:
+                raise
+            except AuthError as err:
+                if attempt == 0:
+                    await self._async_reauthenticate_with_stored_credentials(err)
+                    continue
+                await self._async_raise_auth_failed(err)
+            except ApiError as err:
+                if self._is_invalid_access_token_error(err):
+                    if attempt == 0:
+                        await self._async_reauthenticate_with_stored_credentials(err)
+                        continue
+                    await self._async_raise_auth_failed(err)
+
+                # Transient errors: return last known data instead of marking
+                # all entities unavailable. Matches mobile app behavior.
+                if self.data and self.data.get("modules"):
+                    _LOGGER.warning(
+                        "Transient error during update (%s: %s), keeping last known data.",
+                        type(err).__name__,
+                        err,
+                    )
+                    return self.data
+                raise UpdateFailed(f"API error (no previous data): {err}") from err
+            except (TimeoutError, OSError, ConnectionError) as err:
+                # Transient errors: return last known data instead of marking
+                # all entities unavailable. Matches mobile app behavior.
+                if self.data and self.data.get("modules"):
+                    _LOGGER.warning(
+                        "Transient error during update (%s: %s), keeping last known data.",
+                        type(err).__name__,
+                        err,
+                    )
+                    return self.data
+                raise UpdateFailed(f"API error (no previous data): {err}") from err
+            except UpdateFailed:
+                raise
+            except Exception as err:
+                _LOGGER.exception("Unexpected error during data fetch")
+                raise UpdateFailed(f"Unexpected error: {err}") from err
+
+        raise UpdateFailed("API error after re-authentication")
+
+    async def _async_update_data_once(self) -> dict[str, Any]:
+        """Fetch data from the API once without retrying authentication failures."""
         _LOGGER.debug("Coordinator: Starting data update")
         homes_data = {}
         modules_data = {}
 
-        try:
-            await self.account.async_update_topology()
-            if not self.account.homes:
-                _LOGGER.warning("No homes found for this account.")
-                return {
-                    "homes": {},
-                    "modules": {},
-                    "events_history": {},
-                    DATA_LAST_EVENT: {},
-                }
-            if self.home_id not in self.account.homes:
-                raise UpdateFailed(f"Selected home_id {self.home_id} not found in account topology.")
-
-            selected_home_obj = self.account.homes[self.home_id]
-            homes_data[self.home_id] = selected_home_obj.raw_data
-
-            # Find the main bridge module by checking if the ID is a MAC address
-            bridge_module = None
-            mac_address_pattern = re.compile(r"^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$")
-            # LOOP 1: Populate modules_data based on topology AND find the bridge
-            for module_obj in selected_home_obj.modules:
-                modules_data[module_obj.id] = module_obj.raw_data
-                # Check if the module ID matches the MAC address pattern and we haven't found the bridge yet
-                if not bridge_module and mac_address_pattern.match(module_obj.id):
-                    bridge_module = module_obj
-                    _LOGGER.debug("Found bridge module with MAC ID: %s", module_obj.id)
-                    # Do NOT break, continue populating modules_data
-
-            if not bridge_module:
-                # Log the available module types and IDs for debugging
-                available_modules_info = [
-                    f"ID: {m.id}, Type: {m.raw_data.get('type', 'N/A')}, Variant: {m.raw_data.get('variant', 'N/A')}"
-                    for m in selected_home_obj.modules
-                ]
-                _LOGGER.error(
-                    "No bridge module found (expected ID formatted as MAC address). Available modules: %s",
-                    available_modules_info,
-                )
-                raise UpdateFailed("No bridge module found in the system (MAC address ID check failed)")
-
-            # Store the bridge module ID as our main device ID
-            self._main_device_id = bridge_module.id
-
-            # Fetch Status Data
-            try:
-                status_data = await self.account.async_get_home_status(self.home_id)
-                modules_status = status_data.get("body", {}).get("home", {}).get("modules", [])
-            except AuthError as err:
-                await self._async_raise_auth_failed(err)
-            except ApiError as err:
-                if self._is_invalid_access_token_error(err):
-                    await self._async_raise_auth_failed(err)
-                _LOGGER.warning("Failed to fetch status for home %s: %s", self.home_id, err)
-                modules_status = []
-
-            # Update modules with status data
-            for module_status_update in modules_status:
-                module_id = module_status_update.get("id")
-                if module_id and module_id in modules_data:
-                    for key, value in module_status_update.items():
-                        if key != "id":
-                            modules_data[module_id][key] = value
-
-            # Register/Update the main device in the registry
-            device_registry = dr.async_get(self.hass)
-            device_registry.async_get_or_create(
-                config_entry_id=self.entry.entry_id,
-                identifiers={(DOMAIN, self._main_device_id)},
-                manufacturer="BTicino",
-                model=bridge_module.raw_data.get("type", DEFAULT_NAME),
-                name=f"BTicino Intercom - {self.home_name}",
-                sw_version=str(
-                    bridge_module.raw_data.get("firmware_name")
-                    or bridge_module.raw_data.get("firmware_revision", "Unknown")
-                ),
-            )
-
-            # Fetch Events
-            events_history_data = {}
-            try:
-                events_data = await self.account.async_get_events(self.home_id, size=20)
-                events_history_data[self.home_id] = events_data.get("body", {}).get("home", {}).get("events", [])
-            except AuthError as err:
-                await self._async_raise_auth_failed(err)
-            except ApiError as err:
-                if self._is_invalid_access_token_error(err):
-                    await self._async_raise_auth_failed(err)
-                _LOGGER.warning("Failed to fetch events for home %s: %s", self.home_id, err)
-                events_history_data[self.home_id] = []
-
-            final_data = {
-                "homes": homes_data,
-                "modules": modules_data,
-                "events_history": events_history_data,
-                DATA_LAST_EVENT: self.data.get(DATA_LAST_EVENT, {}),
+        await self.account.async_update_topology()
+        if not self.account.homes:
+            _LOGGER.warning("No homes found for this account.")
+            return {
+                "homes": {},
+                "modules": {},
+                "events_history": {},
+                DATA_LAST_EVENT: {},
             }
+        if self.home_id not in self.account.homes:
+            raise UpdateFailed(f"Selected home_id {self.home_id} not found in account topology.")
 
-            if "name" in final_data["homes"][self.home_id]:
-                self._home_name = final_data["homes"][self.home_id]["name"]
-                _LOGGER.debug("Home name set to: %s", self._home_name)
+        selected_home_obj = self.account.homes[self.home_id]
+        homes_data[self.home_id] = selected_home_obj.raw_data
 
-            # Check WebSocket health: if we haven't received a message in a while,
-            # flag the connection as stale so the manager can force a reconnect.
-            if self._last_ws_message_time:
-                silence = (datetime.now(UTC) - self._last_ws_message_time).total_seconds()
-                if silence > WS_STALE_THRESHOLD:
-                    _LOGGER.warning(
-                        "WebSocket has been silent for %ds (threshold %ds), flagging as stale",
-                        int(silence),
-                        WS_STALE_THRESHOLD,
-                    )
-                    self._ws_stale = True
+        # Find the main bridge module by checking if the ID is a MAC address
+        bridge_module = None
+        mac_address_pattern = re.compile(r"^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$")
+        # LOOP 1: Populate modules_data based on topology AND find the bridge
+        for module_obj in selected_home_obj.modules:
+            modules_data[module_obj.id] = module_obj.raw_data
+            # Check if the module ID matches the MAC address pattern and we haven't found the bridge yet
+            if not bridge_module and mac_address_pattern.match(module_obj.id):
+                bridge_module = module_obj
+                _LOGGER.debug("Found bridge module with MAC ID: %s", module_obj.id)
+                # Do NOT break, continue populating modules_data
 
-            return final_data
+        if not bridge_module:
+            # Log the available module types and IDs for debugging
+            available_modules_info = [
+                f"ID: {m.id}, Type: {m.raw_data.get('type', 'N/A')}, Variant: {m.raw_data.get('variant', 'N/A')}"
+                for m in selected_home_obj.modules
+            ]
+            _LOGGER.error(
+                "No bridge module found (expected ID formatted as MAC address). Available modules: %s",
+                available_modules_info,
+            )
+            raise UpdateFailed("No bridge module found in the system (MAC address ID check failed)")
 
-        except ConfigEntryAuthFailed:
+        # Store the bridge module ID as our main device ID
+        self._main_device_id = bridge_module.id
+
+        # Fetch Status Data
+        try:
+            status_data = await self.account.async_get_home_status(self.home_id)
+            modules_status = status_data.get("body", {}).get("home", {}).get("modules", [])
+        except AuthError:
             raise
-        except AuthError as err:
-            # Auth errors are critical; must re-authenticate.
-            await self._async_raise_auth_failed(err)
         except ApiError as err:
             if self._is_invalid_access_token_error(err):
-                await self._async_raise_auth_failed(err)
+                raise
+            _LOGGER.warning("Failed to fetch status for home %s: %s", self.home_id, err)
+            modules_status = []
 
-            # Transient errors: return last known data instead of marking
-            # all entities unavailable. Matches mobile app behavior.
-            if self.data and self.data.get("modules"):
+        # Update modules with status data
+        for module_status_update in modules_status:
+            module_id = module_status_update.get("id")
+            if module_id and module_id in modules_data:
+                for key, value in module_status_update.items():
+                    if key != "id":
+                        modules_data[module_id][key] = value
+
+        # Register/Update the main device in the registry
+        device_registry = dr.async_get(self.hass)
+        device_registry.async_get_or_create(
+            config_entry_id=self.entry.entry_id,
+            identifiers={(DOMAIN, self._main_device_id)},
+            manufacturer="BTicino",
+            model=bridge_module.raw_data.get("type", DEFAULT_NAME),
+            name=f"BTicino Intercom - {self.home_name}",
+            sw_version=str(
+                bridge_module.raw_data.get("firmware_name")
+                or bridge_module.raw_data.get("firmware_revision", "Unknown")
+            ),
+        )
+
+        # Fetch Events
+        events_history_data = {}
+        try:
+            events_data = await self.account.async_get_events(self.home_id, size=20)
+            events_history_data[self.home_id] = events_data.get("body", {}).get("home", {}).get("events", [])
+        except AuthError:
+            raise
+        except ApiError as err:
+            if self._is_invalid_access_token_error(err):
+                raise
+            _LOGGER.warning("Failed to fetch events for home %s: %s", self.home_id, err)
+            events_history_data[self.home_id] = []
+
+        final_data = {
+            "homes": homes_data,
+            "modules": modules_data,
+            "events_history": events_history_data,
+            DATA_LAST_EVENT: self.data.get(DATA_LAST_EVENT, {}),
+        }
+
+        if "name" in final_data["homes"][self.home_id]:
+            self._home_name = final_data["homes"][self.home_id]["name"]
+            _LOGGER.debug("Home name set to: %s", self._home_name)
+
+        # Check WebSocket health: if we haven't received a message in a while,
+        # flag the connection as stale so the manager can force a reconnect.
+        if self._last_ws_message_time:
+            silence = (datetime.now(UTC) - self._last_ws_message_time).total_seconds()
+            if silence > WS_STALE_THRESHOLD:
                 _LOGGER.warning(
-                    "Transient error during update (%s: %s), keeping last known data.",
-                    type(err).__name__,
-                    err,
+                    "WebSocket has been silent for %ds (threshold %ds), flagging as stale",
+                    int(silence),
+                    WS_STALE_THRESHOLD,
                 )
-                return self.data
-            raise UpdateFailed(f"API error (no previous data): {err}") from err
-        except (TimeoutError, OSError, ConnectionError) as err:
-            # Transient errors: return last known data instead of marking
-            # all entities unavailable. Matches mobile app behavior.
-            if self.data and self.data.get("modules"):
-                _LOGGER.warning(
-                    "Transient error during update (%s: %s), keeping last known data.",
-                    type(err).__name__,
-                    err,
-                )
-                return self.data
-            raise UpdateFailed(f"API error (no previous data): {err}") from err
-        except Exception as err:
-            _LOGGER.exception("Unexpected error during data fetch")
-            raise UpdateFailed(f"Unexpected error: {err}") from err
+                self._ws_stale = True
+
+        return final_data
 
     def _process_incoming_call_push(self, extra_params: dict[str, Any]) -> bool:
         """Process incoming_call push to extract snapshot/vignette URLs.

@@ -51,14 +51,88 @@ async def test_coordinator_home_name(
     assert coordinator.normalized_home_name == "casa_test"
 
 
-async def test_coordinator_refresh_auth_error(
+async def test_coordinator_refresh_auth_error_reauthenticates_and_retries(
     hass: HomeAssistant,
     mock_setup_entry: MockConfigEntry,
     mock_account: AsyncMock,
 ) -> None:
-    """Test coordinator raises ConfigEntryAuthFailed on auth errors during refresh."""
+    """Test coordinator retries with stored credentials on auth errors during refresh."""
+    coordinator = hass.data[DOMAIN][mock_setup_entry.entry_id]["coordinator"]
+    mock_account.async_update_topology.side_effect = [AuthError("Token expired"), None]
+    mock_account.auth_handler = MagicMock()
+    mock_account.auth_handler.authenticate = AsyncMock()
+    mock_store = MagicMock()
+    mock_store.async_remove = AsyncMock()
+
+    with patch("custom_components.bticino_intercom.coordinator.Store", return_value=mock_store):
+        data = await coordinator._async_update_data()
+
+    mock_store.async_remove.assert_awaited_once()
+    mock_account.auth_handler.authenticate.assert_awaited_once()
+    assert data["modules"]
+
+
+async def test_coordinator_invalid_token_api_error_reauthenticates_and_retries(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+    mock_account: AsyncMock,
+) -> None:
+    """Test coordinator retries with stored credentials on invalid token API errors."""
+    coordinator = hass.data[DOMAIN][mock_setup_entry.entry_id]["coordinator"]
+    mock_account.async_update_topology.side_effect = [ApiError(403, "Invalid access token"), None]
+    mock_account.auth_handler = MagicMock()
+    mock_account.auth_handler.authenticate = AsyncMock()
+    mock_store = MagicMock()
+    mock_store.async_remove = AsyncMock()
+
+    with patch("custom_components.bticino_intercom.coordinator.Store", return_value=mock_store):
+        data = await coordinator._async_update_data()
+
+    mock_store.async_remove.assert_awaited_once()
+    mock_account.auth_handler.authenticate.assert_awaited_once()
+    assert data["modules"]
+
+
+async def test_coordinator_status_auth_error_reauthenticates_and_retries(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+    mock_account: AsyncMock,
+) -> None:
+    """Test coordinator retries with stored credentials when status fetch needs reauth."""
+    coordinator = hass.data[DOMAIN][mock_setup_entry.entry_id]["coordinator"]
+    mock_account.async_get_home_status.side_effect = [
+        AuthError("Invalid access token"),
+        {
+            "body": {
+                "home": {
+                    "modules": [],
+                }
+            }
+        },
+    ]
+    mock_account.auth_handler = MagicMock()
+    mock_account.auth_handler.authenticate = AsyncMock()
+    mock_store = MagicMock()
+    mock_store.async_remove = AsyncMock()
+
+    with patch("custom_components.bticino_intercom.coordinator.Store", return_value=mock_store):
+        data = await coordinator._async_update_data()
+
+    mock_store.async_remove.assert_awaited_once()
+    mock_account.auth_handler.authenticate.assert_awaited_once()
+    assert data["modules"]
+
+
+async def test_coordinator_auth_error_triggers_reauth_when_stored_password_fails(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+    mock_account: AsyncMock,
+) -> None:
+    """Test coordinator asks HA for reauth when stored credentials no longer work."""
     coordinator = hass.data[DOMAIN][mock_setup_entry.entry_id]["coordinator"]
     mock_account.async_update_topology.side_effect = AuthError("Token expired")
+    mock_account.auth_handler = MagicMock()
+    mock_account.auth_handler.authenticate = AsyncMock(side_effect=AuthError("Bad credentials"))
     mock_store = MagicMock()
     mock_store.async_remove = AsyncMock()
 
@@ -68,47 +142,8 @@ async def test_coordinator_refresh_auth_error(
     ):
         await coordinator._async_update_data()
 
-    mock_store.async_remove.assert_awaited_once()
-
-
-async def test_coordinator_invalid_token_api_error_triggers_reauth(
-    hass: HomeAssistant,
-    mock_setup_entry: MockConfigEntry,
-    mock_account: AsyncMock,
-) -> None:
-    """Test coordinator clears tokens and raises ConfigEntryAuthFailed on invalid token API errors."""
-    coordinator = hass.data[DOMAIN][mock_setup_entry.entry_id]["coordinator"]
-    mock_account.async_update_topology.side_effect = ApiError(403, "Invalid access token")
-    mock_store = MagicMock()
-    mock_store.async_remove = AsyncMock()
-
-    with (
-        patch("custom_components.bticino_intercom.coordinator.Store", return_value=mock_store),
-        pytest.raises(ConfigEntryAuthFailed),
-    ):
-        await coordinator._async_update_data()
-
-    mock_store.async_remove.assert_awaited_once()
-
-
-async def test_coordinator_status_auth_error_triggers_reauth(
-    hass: HomeAssistant,
-    mock_setup_entry: MockConfigEntry,
-    mock_account: AsyncMock,
-) -> None:
-    """Test coordinator raises ConfigEntryAuthFailed when status fetch needs reauth."""
-    coordinator = hass.data[DOMAIN][mock_setup_entry.entry_id]["coordinator"]
-    mock_account.async_get_home_status.side_effect = AuthError("Invalid access token")
-    mock_store = MagicMock()
-    mock_store.async_remove = AsyncMock()
-
-    with (
-        patch("custom_components.bticino_intercom.coordinator.Store", return_value=mock_store),
-        pytest.raises(ConfigEntryAuthFailed),
-    ):
-        await coordinator._async_update_data()
-
-    mock_store.async_remove.assert_awaited_once()
+    mock_store.async_remove.assert_awaited()
+    mock_account.auth_handler.authenticate.assert_awaited_once()
 
 
 async def test_coordinator_refresh_api_error_returns_stale_data(

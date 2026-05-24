@@ -189,15 +189,17 @@ async def test_tokens_cleaned_on_remove(
     mock_token_store.async_remove.assert_awaited_once()
 
 
-async def test_tokens_cleaned_on_auth_error(
+async def test_tokens_refreshed_on_auth_error_with_stored_password(
     hass: HomeAssistant,
     mock_config_entry_for_tokens: MockConfigEntry,
+    mock_account: AsyncMock,
+    mock_websocket_client: MagicMock,
     mock_token_store: MagicMock,
 ) -> None:
-    """Verify setup removes stored tokens when authentication fails."""
+    """Verify setup removes stored tokens and retries full auth with stored credentials."""
     mock_auth = MagicMock()
-    mock_auth.get_access_token = AsyncMock(side_effect=AuthError("Bad credentials"))
-    mock_auth.close_session = AsyncMock()
+    mock_auth.get_access_token = AsyncMock(side_effect=AuthError("Token refresh failed"))
+    mock_auth.authenticate = AsyncMock()
     mock_auth.set_tokens = MagicMock()
 
     with (
@@ -205,21 +207,47 @@ async def test_tokens_cleaned_on_auth_error(
         patch("custom_components.bticino_intercom.AuthHandler", return_value=mock_auth),
     ):
         mock_config_entry_for_tokens.add_to_hass(hass)
-        await hass.config_entries.async_setup(mock_config_entry_for_tokens.entry_id)
+        assert await hass.config_entries.async_setup(mock_config_entry_for_tokens.entry_id)
         await hass.async_block_till_done()
 
     mock_token_store.async_remove.assert_awaited_once()
+    mock_auth.authenticate.assert_awaited_once()
 
 
-async def test_tokens_cleaned_on_invalid_access_token_api_error(
+async def test_tokens_refreshed_on_invalid_access_token_api_error(
     hass: HomeAssistant,
     mock_config_entry_for_tokens: MockConfigEntry,
+    mock_account: AsyncMock,
+    mock_websocket_client: MagicMock,
     mock_token_store: MagicMock,
 ) -> None:
-    """Verify setup removes stored tokens when the API reports an invalid access token."""
+    """Verify setup removes invalid stored tokens and retries full auth."""
     mock_auth = MagicMock()
     mock_auth.get_access_token = AsyncMock(side_effect=ApiError(403, "Invalid access token"))
-    mock_auth.close_session = AsyncMock()
+    mock_auth.authenticate = AsyncMock()
+    mock_auth.set_tokens = MagicMock()
+
+    with (
+        patch("custom_components.bticino_intercom.Store", return_value=mock_token_store),
+        patch("custom_components.bticino_intercom.AuthHandler", return_value=mock_auth),
+    ):
+        mock_config_entry_for_tokens.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(mock_config_entry_for_tokens.entry_id)
+        await hass.async_block_till_done()
+
+    mock_token_store.async_remove.assert_awaited_once()
+    mock_auth.authenticate.assert_awaited_once()
+
+
+async def test_setup_reauth_required_when_stored_password_auth_fails(
+    hass: HomeAssistant,
+    mock_config_entry_for_tokens: MockConfigEntry,
+    mock_token_store: MagicMock,
+) -> None:
+    """Verify setup triggers reauth only when full auth with stored credentials fails."""
+    mock_auth = MagicMock()
+    mock_auth.get_access_token = AsyncMock(side_effect=ApiError(403, "Invalid access token"))
+    mock_auth.authenticate = AsyncMock(side_effect=AuthError("Bad credentials"))
     mock_auth.set_tokens = MagicMock()
 
     with (
@@ -231,3 +259,4 @@ async def test_tokens_cleaned_on_invalid_access_token_api_error(
         await hass.async_block_till_done()
 
     mock_token_store.async_remove.assert_awaited_once()
+    mock_auth.authenticate.assert_awaited_once()
