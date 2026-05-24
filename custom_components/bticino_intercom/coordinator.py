@@ -11,6 +11,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from pybticino import AsyncAccount, WebsocketClient
 from pybticino.exceptions import ApiError, AuthError
@@ -28,6 +29,7 @@ from .const import (
     EVENT_TYPE_INCOMING_CALL,
     EVENT_TYPE_TERMINATED,
     SIGNAL_CALL_RECEIVED,
+    TOKEN_STORAGE_VERSION,
     UPDATE_INTERVAL,
 )
 
@@ -96,6 +98,19 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             self._normalized_home_name = self._home_name.lower().replace(" ", "_")
         return self._normalized_home_name or "unknown"
 
+    @staticmethod
+    def _is_invalid_access_token_error(err: ApiError) -> bool:
+        """Return True if an API error represents an invalid stored access token."""
+        error_message = str(err).lower()
+        return "403" in error_message or "invalid access token" in error_message
+
+    async def _async_raise_auth_failed(self, err: Exception) -> None:
+        """Remove persisted tokens and trigger Home Assistant reauth."""
+        _LOGGER.warning("Authentication failed during BTicino update, removing stored tokens")
+        token_store = Store(self.hass, TOKEN_STORAGE_VERSION, f"{DOMAIN}.tokens.{self.entry.entry_id}")
+        await token_store.async_remove()
+        raise ConfigEntryAuthFailed(f"Authentication error: {err}") from err
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the API, register devices, and return the combined data."""
         _LOGGER.debug("Coordinator: Starting data update")
@@ -150,8 +165,10 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
                 status_data = await self.account.async_get_home_status(self.home_id)
                 modules_status = status_data.get("body", {}).get("home", {}).get("modules", [])
             except AuthError as err:
-                raise ConfigEntryAuthFailed(f"Authentication error: {err}") from err
+                await self._async_raise_auth_failed(err)
             except ApiError as err:
+                if self._is_invalid_access_token_error(err):
+                    await self._async_raise_auth_failed(err)
                 _LOGGER.warning("Failed to fetch status for home %s: %s", self.home_id, err)
                 modules_status = []
 
@@ -183,8 +200,10 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
                 events_data = await self.account.async_get_events(self.home_id, size=20)
                 events_history_data[self.home_id] = events_data.get("body", {}).get("home", {}).get("events", [])
             except AuthError as err:
-                raise ConfigEntryAuthFailed(f"Authentication error: {err}") from err
+                await self._async_raise_auth_failed(err)
             except ApiError as err:
+                if self._is_invalid_access_token_error(err):
+                    await self._async_raise_auth_failed(err)
                 _LOGGER.warning("Failed to fetch events for home %s: %s", self.home_id, err)
                 events_history_data[self.home_id] = []
 
@@ -217,8 +236,22 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             raise
         except AuthError as err:
             # Auth errors are critical; must re-authenticate.
-            raise ConfigEntryAuthFailed(f"Authentication error: {err}") from err
-        except (ApiError, TimeoutError, OSError, ConnectionError) as err:
+            await self._async_raise_auth_failed(err)
+        except ApiError as err:
+            if self._is_invalid_access_token_error(err):
+                await self._async_raise_auth_failed(err)
+
+            # Transient errors: return last known data instead of marking
+            # all entities unavailable. Matches mobile app behavior.
+            if self.data and self.data.get("modules"):
+                _LOGGER.warning(
+                    "Transient error during update (%s: %s), keeping last known data.",
+                    type(err).__name__,
+                    err,
+                )
+                return self.data
+            raise UpdateFailed(f"API error (no previous data): {err}") from err
+        except (TimeoutError, OSError, ConnectionError) as err:
             # Transient errors: return last known data instead of marking
             # all entities unavailable. Matches mobile app behavior.
             if self.data and self.data.get("modules"):
