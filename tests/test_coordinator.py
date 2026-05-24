@@ -3,7 +3,9 @@
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from pybticino.exceptions import ApiError, AuthError
 from pytest_homeassistant_custom_component.common import (
@@ -54,13 +56,25 @@ async def test_coordinator_refresh_auth_error(
     mock_setup_entry: MockConfigEntry,
     mock_account: AsyncMock,
 ) -> None:
-    """Test coordinator handles auth errors during refresh."""
+    """Test coordinator raises ConfigEntryAuthFailed on auth errors during refresh."""
     coordinator = hass.data[DOMAIN][mock_setup_entry.entry_id]["coordinator"]
     mock_account.async_update_topology.side_effect = AuthError("Token expired")
 
-    await coordinator.async_refresh()
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_update_data()
 
-    assert coordinator.last_update_success is False
+
+async def test_coordinator_status_auth_error_triggers_reauth(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+    mock_account: AsyncMock,
+) -> None:
+    """Test coordinator raises ConfigEntryAuthFailed when status fetch needs reauth."""
+    coordinator = hass.data[DOMAIN][mock_setup_entry.entry_id]["coordinator"]
+    mock_account.async_get_home_status.side_effect = AuthError("Invalid access token")
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_update_data()
 
 
 async def test_coordinator_refresh_api_error_returns_stale_data(

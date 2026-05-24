@@ -8,6 +8,7 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -148,7 +149,9 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             try:
                 status_data = await self.account.async_get_home_status(self.home_id)
                 modules_status = status_data.get("body", {}).get("home", {}).get("modules", [])
-            except (ApiError, AuthError) as err:
+            except AuthError as err:
+                raise ConfigEntryAuthFailed(f"Authentication error: {err}") from err
+            except ApiError as err:
                 _LOGGER.warning("Failed to fetch status for home %s: %s", self.home_id, err)
                 modules_status = []
 
@@ -179,7 +182,9 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             try:
                 events_data = await self.account.async_get_events(self.home_id, size=20)
                 events_history_data[self.home_id] = events_data.get("body", {}).get("home", {}).get("events", [])
-            except (ApiError, AuthError) as err:
+            except AuthError as err:
+                raise ConfigEntryAuthFailed(f"Authentication error: {err}") from err
+            except ApiError as err:
                 _LOGGER.warning("Failed to fetch events for home %s: %s", self.home_id, err)
                 events_history_data[self.home_id] = []
 
@@ -208,9 +213,11 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
 
             return final_data
 
+        except ConfigEntryAuthFailed:
+            raise
         except AuthError as err:
-            # Auth errors are critical — must re-authenticate
-            raise UpdateFailed(f"Authentication error: {err}") from err
+            # Auth errors are critical; must re-authenticate.
+            raise ConfigEntryAuthFailed(f"Authentication error: {err}") from err
         except (ApiError, TimeoutError, OSError, ConnectionError) as err:
             # Transient errors: return last known data instead of marking
             # all entities unavailable. Matches mobile app behavior.

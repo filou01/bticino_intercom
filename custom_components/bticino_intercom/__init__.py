@@ -33,6 +33,7 @@ from pybticino.exceptions import ApiError, AuthError, PyBticinoException
 from .const import (
     DOMAIN,
     PLATFORMS,
+    TOKEN_STORAGE_VERSION,
 )
 from .coordinator import BticinoIntercomCoordinator
 
@@ -46,8 +47,6 @@ WEBSOCKET_TASK_KEY = "websocket_connection_task"
 WEBSOCKET_CLIENT_KEY = "websocket_client"
 COORDINATOR_KEY = "coordinator"
 START_LISTENER_REMOVE_KEY = "start_listener_remove"
-TOKEN_STORAGE_VERSION = 1
-
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up BTicino from a config entry."""
@@ -86,9 +85,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # With restored tokens this will use refresh instead of full auth
         await auth_handler.get_access_token()
     except AuthError as err:
-        _LOGGER.error("Authentication failed: %s", err)
+        _LOGGER.warning("Authentication failed, removing stored BTicino tokens")
+        await token_store.async_remove()
         raise ConfigEntryAuthFailed from err
     except ApiError as err:
+        error_message = str(err).lower()
+        if "403" in error_message or "invalid access token" in error_message:
+            _LOGGER.warning("Invalid BTicino access token, removing stored tokens")
+            await token_store.async_remove()
+            raise ConfigEntryAuthFailed from err
+
         _LOGGER.error("Client error during authentication: %s", err)
         raise ConfigEntryNotReady from err
 

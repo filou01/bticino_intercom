@@ -6,6 +6,7 @@ from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from pybticino.exceptions import ApiError, AuthError
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.bticino_intercom.const import DOMAIN
 
@@ -327,3 +328,52 @@ async def test_options_flow(
     )
     assert result2["type"] is FlowResultType.CREATE_ENTRY
     assert result2["data"]["light_as_lock"] is True
+
+
+async def test_reauth_success_removes_stored_tokens_before_reload(hass: HomeAssistant) -> None:
+    """Test successful reauth removes stale persisted tokens before reloading."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Casa Test",
+        data={"username": "user@example.com", "password": "old", "home_id": "home_123"},
+        unique_id="user@example.com",
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
+
+    call_order = []
+    mock_store = MagicMock()
+    mock_store.async_remove = AsyncMock(side_effect=lambda: call_order.append("remove"))
+    mock_reload = AsyncMock(side_effect=lambda entry_id: call_order.append("reload"))
+
+    with (
+        patch(
+            "custom_components.bticino_intercom.config_flow.validate_input",
+            new_callable=AsyncMock,
+        ) as mock_validate,
+        patch("custom_components.bticino_intercom.config_flow.Store", return_value=mock_store),
+        patch.object(hass.config_entries, "async_reload", mock_reload),
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"password": "new-secret"},
+        )
+
+    assert result2["type"] is FlowResultType.ABORT
+    assert result2["reason"] == "reauth_successful"
+    assert entry.data["password"] == "new-secret"
+    mock_validate.assert_awaited_once_with(
+        hass,
+        {"username": "user@example.com", "password": "new-secret"},
+    )
+    mock_store.async_remove.assert_awaited_once()
+    mock_reload.assert_awaited_once_with(entry.entry_id)
+    assert call_order == ["remove", "reload"]

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.core import HomeAssistant
+from pybticino.exceptions import ApiError, AuthError
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.bticino_intercom.const import DOMAIN
@@ -185,4 +186,48 @@ async def test_tokens_cleaned_on_remove(
         await hass.async_block_till_done()
 
     # Verify async_remove was called on the store
+    mock_token_store.async_remove.assert_awaited_once()
+
+
+async def test_tokens_cleaned_on_auth_error(
+    hass: HomeAssistant,
+    mock_config_entry_for_tokens: MockConfigEntry,
+    mock_token_store: MagicMock,
+) -> None:
+    """Verify setup removes stored tokens when authentication fails."""
+    mock_auth = MagicMock()
+    mock_auth.get_access_token = AsyncMock(side_effect=AuthError("Bad credentials"))
+    mock_auth.close_session = AsyncMock()
+    mock_auth.set_tokens = MagicMock()
+
+    with (
+        patch("custom_components.bticino_intercom.Store", return_value=mock_token_store),
+        patch("custom_components.bticino_intercom.AuthHandler", return_value=mock_auth),
+    ):
+        mock_config_entry_for_tokens.add_to_hass(hass)
+        await hass.config_entries.async_setup(mock_config_entry_for_tokens.entry_id)
+        await hass.async_block_till_done()
+
+    mock_token_store.async_remove.assert_awaited_once()
+
+
+async def test_tokens_cleaned_on_invalid_access_token_api_error(
+    hass: HomeAssistant,
+    mock_config_entry_for_tokens: MockConfigEntry,
+    mock_token_store: MagicMock,
+) -> None:
+    """Verify setup removes stored tokens when the API reports an invalid access token."""
+    mock_auth = MagicMock()
+    mock_auth.get_access_token = AsyncMock(side_effect=ApiError(403, "Invalid access token"))
+    mock_auth.close_session = AsyncMock()
+    mock_auth.set_tokens = MagicMock()
+
+    with (
+        patch("custom_components.bticino_intercom.Store", return_value=mock_token_store),
+        patch("custom_components.bticino_intercom.AuthHandler", return_value=mock_auth),
+    ):
+        mock_config_entry_for_tokens.add_to_hass(hass)
+        await hass.config_entries.async_setup(mock_config_entry_for_tokens.entry_id)
+        await hass.async_block_till_done()
+
     mock_token_store.async_remove.assert_awaited_once()

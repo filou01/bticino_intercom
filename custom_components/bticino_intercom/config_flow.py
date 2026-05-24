@@ -13,10 +13,11 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 from pybticino import AsyncAccount, AuthHandler
 from pybticino.exceptions import ApiError, AuthError
 
-from .const import DOMAIN
+from .const import DOMAIN, TOKEN_STORAGE_VERSION
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -120,6 +121,12 @@ class BticinoConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_PASSWORD: user_input[CONF_PASSWORD],
                     },
                 )
+                token_store = Store(
+                    self.hass,
+                    TOKEN_STORAGE_VERSION,
+                    f"{DOMAIN}.tokens.{self._reauth_entry.entry_id}",
+                )
+                await token_store.async_remove()
                 await self.hass.config_entries.async_reload(self._reauth_entry.entry_id)
                 return self.async_abort(reason="reauth_successful")
 
